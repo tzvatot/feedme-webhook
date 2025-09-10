@@ -11,43 +11,132 @@ import (
 )
 
 var (
-	// Environment variables
-	whatsappToken   = os.Getenv("WHATSAPP_TOKEN")
-	whatsappPhoneID = os.Getenv("WHATSAPP_PHONE_ID")
-	verifyToken     = os.Getenv("WHATSAPP_VERIFY_TOKEN")
-	port            = os.Getenv("PORT")
+	whatsappToken   = os.Getenv("WHATSAPP_TOKEN")        // WhatsApp Cloud API token
+	whatsappPhoneID = os.Getenv("WHATSAPP_PHONE_ID")     // Phone number ID
+	verifyToken     = os.Getenv("WHATSAPP_VERIFY_TOKEN") // Token for webhook verification
+	port            = os.Getenv("PORT")                  // Port for Render deployment
 )
 
-type WhatsAppMessage struct {
-	Messages []struct {
-		From string `json:"from"`
-		Text struct {
-			Body string `json:"body"`
-		} `json:"text"`
-	} `json:"messages"`
+// Incoming message payload structures
+type TextContent struct {
+	Body string `json:"body"`
 }
 
-func sendWhatsAppMessage(to, message string) error {
-	url := fmt.Sprintf("https://graph.facebook.com/v16.0/%s/messages", whatsappPhoneID)
+type Message struct {
+	From string      `json:"from"`
+	Text TextContent `json:"text"`
+}
 
-	payload := map[string]interface{}{
-		"messaging_product": "whatsapp",
-		"to":                to,
-		"text": map[string]string{
-			"body": message,
-		},
+type WebhookPayload struct {
+	Entry []struct {
+		Changes []struct {
+			Value struct {
+				Messages []Message `json:"messages"`
+			} `json:"value"`
+		} `json:"changes"`
+	} `json:"entry"`
+}
+
+// WhatsApp API outgoing message payload
+type WhatsAppReply struct {
+	MessagingProduct string `json:"messaging_product"`
+	To               string `json:"to"`
+	Type             string `json:"type"`
+	Text             struct {
+		Body string `json:"body"`
+	} `json:"text"`
+}
+
+// Webhook verification
+func verifyWebhook(w http.ResponseWriter, r *http.Request) {
+	mode := r.URL.Query().Get("hub.mode")
+	token := r.URL.Query().Get("hub.verify_token")
+	challenge := r.URL.Query().Get("hub.challenge")
+
+	if mode == "subscribe" && token == verifyToken {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(challenge))
+		log.Println("Webhook verified successfully")
+		return
 	}
+	http.Error(w, "Forbidden", http.StatusForbidden)
+}
 
-	body, err := json.Marshal(payload)
+// Main webhook handler
+func webhookHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		verifyWebhook(w, r)
+	case http.MethodPost:
+		var payload WebhookPayload
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Failed to read request body", http.StatusBadRequest)
+			return
+		}
+		defer r.Body.Close()
+
+		if err := json.Unmarshal(body, &payload); err != nil {
+			log.Printf("Invalid payload: %v", err)
+			http.Error(w, "Invalid payload", http.StatusBadRequest)
+			return
+		}
+
+		message := extractMessage(payload)
+		if message == nil {
+			log.Println("No messages in payload")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		log.Printf("Received message from %s: %s", message.From, message.Text.Body)
+
+		// Process the message (simple echo for now)
+		reply := fmt.Sprintf("You said: %s", message.Text.Body)
+		if err := sendWhatsAppMessage(message.From, reply); err != nil {
+			log.Printf("Error sending reply: %v", err)
+		}
+
+		w.WriteHeader(http.StatusOK)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// Extract the first message safely
+func extractMessage(payload WebhookPayload) *Message {
+	if len(payload.Entry) == 0 {
+		return nil
+	}
+	if len(payload.Entry[0].Changes) == 0 {
+		return nil
+	}
+	if len(payload.Entry[0].Changes[0].Value.Messages) == 0 {
+		return nil
+	}
+	return &payload.Entry[0].Changes[0].Value.Messages[0]
+}
+
+// Send a reply back using WhatsApp API
+func sendWhatsAppMessage(to, body string) error {
+	url := fmt.Sprintf("https://graph.facebook.com/v17.0/%s/messages", whatsappPhoneID)
+
+	reply := WhatsAppReply{
+		MessagingProduct: "whatsapp",
+		To:               to,
+		Type:             "text",
+	}
+	reply.Text.Body = body
+
+	payload, err := json.Marshal(reply)
 	if err != nil {
 		return err
 	}
 
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(body))
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(payload))
 	if err != nil {
 		return err
 	}
-
 	req.Header.Set("Authorization", "Bearer "+whatsappToken)
 	req.Header.Set("Content-Type", "application/json")
 
@@ -59,72 +148,12 @@ func sendWhatsAppMessage(to, message string) error {
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
-	log.Printf("WhatsApp API response: %s", respBody)
+	log.Printf("WhatsApp API response: %s", string(respBody))
 
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("failed to send message, status: %s", resp.Status)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("failed to send message: %s", resp.Status)
 	}
-
 	return nil
-}
-
-func webhookHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodGet {
-		// Verification challenge
-		mode := r.URL.Query().Get("hub.mode")
-		token := r.URL.Query().Get("hub.verify_token")
-		challenge := r.URL.Query().Get("hub.challenge")
-
-		if mode == "subscribe" && token == verifyToken {
-			fmt.Fprint(w, challenge)
-			return
-		} else {
-			http.Error(w, "Forbidden", http.StatusForbidden)
-			return
-		}
-	}
-
-	if r.Method == http.MethodPost {
-		var payload struct {
-			Messages []struct {
-				From string `json:"from"`
-				Text struct {
-					Body string `json:"body"`
-				} `json:"text"`
-			} `json:"messages"`
-		}
-
-		err := json.NewDecoder(r.Body).Decode(&payload)
-		if err != nil {
-			log.Println("Failed to decode payload:", err)
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-
-		if len(payload.Messages) == 0 {
-			log.Println("No messages in payload")
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		from := payload.Messages[0].From
-		userText := payload.Messages[0].Text.Body
-		log.Printf("Received message from %s: %s", from, userText)
-
-		replyText := "Welcome to FeedMe - the first AI chat to feed you!"
-
-		err = sendWhatsAppMessage(from, replyText)
-		if err != nil {
-			log.Printf("Error sending WhatsApp message: %v", err)
-			http.Error(w, "Failed to send message", http.StatusInternalServerError)
-			return
-		}
-
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 }
 
 func main() {
@@ -133,8 +162,9 @@ func main() {
 	}
 
 	http.HandleFunc("/webhook", webhookHandler)
-	log.Printf("Starting server on port %s...", port)
+
+	log.Printf("Server starting on port %s...", port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
+		log.Fatalf("Server failed: %v", err)
 	}
 }
