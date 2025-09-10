@@ -85,21 +85,30 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == http.MethodPost {
-		body, err := io.ReadAll(r.Body)
+		var payload struct {
+			Messages []struct {
+				From string `json:"from"`
+				Text struct {
+					Body string `json:"body"`
+				} `json:"text"`
+			} `json:"messages"`
+		}
+
+		err := json.NewDecoder(r.Body).Decode(&payload)
 		if err != nil {
-			http.Error(w, "Failed to read request body", http.StatusInternalServerError)
+			log.Println("Failed to decode payload:", err)
+			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
 
-		var msg WhatsAppMessage
-		err = json.Unmarshal(body, &msg)
-		if err != nil {
-			http.Error(w, "Failed to parse JSON", http.StatusBadRequest)
+		if len(payload.Messages) == 0 {
+			log.Println("No messages in payload")
+			w.WriteHeader(http.StatusOK)
 			return
 		}
 
-		from := msg.Messages[0].From
-		userText := msg.Messages[0].Text.Body
+		from := payload.Messages[0].From
+		userText := payload.Messages[0].Text.Body
 		log.Printf("Received message from %s: %s", from, userText)
 
 		replyText := "Welcome to FeedMe - the first AI chat to feed you!"
