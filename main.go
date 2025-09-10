@@ -1,32 +1,76 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"os"
 )
 
-const verifyToken = "a67c926c-7c89-438a-a24f-1ebee9cb9b05" // must match the token in Facebook dashboard
+var (
+	// Environment variables
+	whatsappToken   = os.Getenv("WHATSAPP_TOKEN")
+	whatsappPhoneID = os.Getenv("WHATSAPP_PHONE_ID")
+	verifyToken     = os.Getenv("WHATSAPP_VERIFY_TOKEN")
+	port            = os.Getenv("PORT")
+)
 
-type Message struct {
-	From string `json:"from"`
-	Text struct {
-		Body string `json:"body"`
-	} `json:"text"`
+type WhatsAppMessage struct {
+	Messages []struct {
+		From string `json:"from"`
+		Text struct {
+			Body string `json:"body"`
+		} `json:"text"`
+	} `json:"messages"`
 }
 
-type Incoming struct {
-	Messages []Message `json:"messages"`
-}
+func sendWhatsAppMessage(to, message string) error {
+	url := fmt.Sprintf("https://graph.facebook.com/v16.0/%s/messages", whatsappPhoneID)
 
-type Reply struct {
-	Reply string `json:"reply"`
+	payload := map[string]interface{}{
+		"messaging_product": "whatsapp",
+		"to":                to,
+		"text": map[string]string{
+			"body": message,
+		},
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(body))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+whatsappToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	log.Printf("WhatsApp API response: %s", respBody)
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("failed to send message, status: %s", resp.Status)
+	}
+
+	return nil
 }
 
 func webhookHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
-		// Facebook verification
+		// Verification challenge
 		mode := r.URL.Query().Get("hub.mode")
 		token := r.URL.Query().Get("hub.verify_token")
 		challenge := r.URL.Query().Get("hub.challenge")
@@ -34,42 +78,54 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 		if mode == "subscribe" && token == verifyToken {
 			fmt.Fprint(w, challenge)
 			return
+		} else {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
 		}
-		http.Error(w, "Forbidden", http.StatusForbidden)
-		return
 	}
 
 	if r.Method == http.MethodPost {
-		var incoming Incoming
-		err := json.NewDecoder(r.Body).Decode(&incoming)
+		body, err := io.ReadAll(r.Body)
 		if err != nil {
-			http.Error(w, "Bad Request", http.StatusBadRequest)
+			http.Error(w, "Failed to read request body", http.StatusInternalServerError)
 			return
 		}
 
-		// Log received messages
-		fmt.Printf("Received messages: %+v\n", incoming.Messages)
+		var msg WhatsAppMessage
+		err = json.Unmarshal(body, &msg)
+		if err != nil {
+			http.Error(w, "Failed to parse JSON", http.StatusBadRequest)
+			return
+		}
 
-		// Reply with welcome message
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(Reply{Reply: "Welcome to FeedMe - the first AI chat to feed you!"})
+		from := msg.Messages[0].From
+		userText := msg.Messages[0].Text.Body
+		log.Printf("Received message from %s: %s", from, userText)
+
+		replyText := "Welcome to FeedMe - the first AI chat to feed you!"
+
+		err = sendWhatsAppMessage(from, replyText)
+		if err != nil {
+			log.Printf("Error sending WhatsApp message: %v", err)
+			http.Error(w, "Failed to send message", http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 }
 
 func main() {
-	http.HandleFunc("/webhook", webhookHandler)
-
-	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080" // fallback for local testing
+		port = "8080"
 	}
 
-	err := http.ListenAndServe(":"+port, nil)
-	if err != nil {
-		fmt.Printf("Server failed to start: %v\n", err)
-		os.Exit(1)
+	http.HandleFunc("/webhook", webhookHandler)
+	log.Printf("Starting server on port %s...", port)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		log.Fatalf("Failed to start server: %v", err)
 	}
 }
