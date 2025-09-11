@@ -15,6 +15,7 @@ var (
 	whatsappPhoneID = os.Getenv("WHATSAPP_PHONE_ID")     // Phone number ID
 	verifyToken     = os.Getenv("WHATSAPP_VERIFY_TOKEN") // Token for webhook verification
 	port            = os.Getenv("PORT")                  // Port for Render deployment
+	anthropicAPIKey = os.Getenv("ANTHROPIC_API_KEY")     // Anthropic API key
 )
 
 // Incoming message payload structures
@@ -45,6 +46,27 @@ type WhatsAppReply struct {
 	Text             struct {
 		Body string `json:"body"`
 	} `json:"text"`
+}
+
+// Anthropic Messages API request/response structures
+type AnthropicMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type AnthropicRequest struct {
+	Model     string             `json:"model"`
+	MaxTokens int                `json:"max_tokens"`
+	Messages  []AnthropicMessage `json:"messages"`
+}
+
+type AnthropicContentBlock struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+type AnthropicResponse struct {
+	Content []AnthropicContentBlock `json:"content"`
 }
 
 // Webhook verification
@@ -91,11 +113,8 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 
 		log.Printf("Received message from %s: %s", message.From, message.Text.Body)
 
-		// Process the message (simple echo for now)
-		reply := fmt.Sprintf("You said: %s", message.Text.Body)
-		if err := sendWhatsAppMessage(message.From, reply); err != nil {
-			log.Printf("Error sending reply: %v", err)
-		}
+		// Process the message with Claude and send reply
+		processUserMessage(*message)
 
 		w.WriteHeader(http.StatusOK)
 	default:
@@ -154,6 +173,79 @@ func sendWhatsAppMessage(to, body string) error {
 		return fmt.Errorf("failed to send message: %s", resp.Status)
 	}
 	return nil
+}
+
+// Call Anthropic Claude Messages API to get a reply for the user text
+func callClaude(userText string) (string, error) {
+	if anthropicAPIKey == "" {
+		return "", fmt.Errorf("missing ANTHROPIC_API_KEY")
+	}
+
+	reqBody := AnthropicRequest{
+		Model:     "claude-3-5-sonnet-20240620",
+		MaxTokens: 1024,
+		Messages: []AnthropicMessage{
+			{Role: "user", Content: userText},
+		},
+	}
+
+	b, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewBuffer(b))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("x-api-key", anthropicAPIKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("content-type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("anthropic API error: %s - %s", resp.Status, string(respBytes))
+	}
+
+	var ar AnthropicResponse
+	if err := json.Unmarshal(respBytes, &ar); err != nil {
+		return "", err
+	}
+
+	// Concatenate any text blocks in the response content
+	var replyText string
+	for _, block := range ar.Content {
+		if block.Type == "text" {
+			replyText += block.Text
+		}
+	}
+	if replyText == "" {
+		replyText = "(no response)"
+	}
+	return replyText, nil
+}
+
+// Orchestrate processing of a user message: call Claude and send WhatsApp reply
+func processUserMessage(msg Message) {
+	reply, err := callClaude(msg.Text.Body)
+	if err != nil {
+		log.Printf("Claude call failed: %v", err)
+		reply = "Sorry, I'm having trouble responding right now."
+	}
+	if err := sendWhatsAppMessage(msg.From, reply); err != nil {
+		log.Printf("Error sending reply: %v", err)
+	}
 }
 
 func main() {
