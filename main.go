@@ -16,6 +16,7 @@ var (
 	verifyToken     = os.Getenv("WHATSAPP_VERIFY_TOKEN") // Token for webhook verification
 	port            = os.Getenv("PORT")                  // Port for Render deployment
 	anthropicAPIKey = os.Getenv("ANTHROPIC_API_KEY")     // Anthropic API key
+	anthropicModel  = os.Getenv("ANTHROPIC_MODEL")
 )
 
 // Incoming message payload structures
@@ -182,7 +183,7 @@ func callClaude(userText string) (string, error) {
 	}
 
 	reqBody := AnthropicRequest{
-		Model:     "claude-3-5-sonnet-20240620",
+		Model:     anthropicModel,
 		MaxTokens: 1024,
 		Messages: []AnthropicMessage{
 			{Role: "user", Content: userText},
